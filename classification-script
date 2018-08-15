@@ -1,0 +1,608 @@
+// Script for plantation mapping in the Southern Highlands, Tanzania
+// Ulpu Leinonen, Geospatial analyst, FAO/UTU
+
+// To get access to the script's training data, Sentinel-1 images and study area water/wetlandmask
+// you may contact Ulpu Mankinen, ulpu.leinonen@utu.fi
+
+
+// Including a script for creation of cloud-free mosaic based on Landsat 8 developed by Erik Lindquist (Erik.Lindquist@fao.org),
+// adjusted by Antonia Ortmann (Antonia.Ortmann@fao.org) and Ulpu Leinonen 
+// No warranties of any kind, NB: FAO has developed the script since this version
+
+// Including a script for cloud-masked Sentinel-2 mosaic by Remi D'Annunzio (remi.dannunzio@fao.org)
+
+///////////////////////////////////////////////////////////////
+//     FIRST STAGE OF THE MAPPING:                          //
+//    Create the plantation area mask                       //
+////////////////////////////////////////////////////////////
+
+//////////////////////////////////////
+//   PART 1: Define map settings   //
+////////////////////////////////////
+// Start with definitions of area, data and inputs to use
+// Map settings: where to center the map (coordinates, zoom level)
+Map.setCenter(35.4, -8.49, 10);
+// Specify the area of interest 
+var aoi_sh = ee.Geometry.Rectangle(32, -10.9, 37, -6.8); // bounding box southern highlands region
+
+
+///////////////////////////////////////////////////
+///  PART 2: add the water mask and Sentinel-1  //
+///////////////////////////////////////////////////
+// note; these files are uploaded into GEE as assets. If you wish to use them, request for permission to access 
+
+// Add a water/wetlandmask for the aoi
+var waterwlmask = image3.select('b1');
+// Add the Sentinel-1 data 
+var sentinel_VH = image.select('b1').clip(aoi_sh);
+var sentinel_VV = image2.select('b1').clip(aoi_sh);
+
+/////////////////////////////////////////////////////////////
+///  PART 3: add the elevation model and calculate slope  //
+///////////////////////////////////////////////////////////
+
+// add the SRTM DEM
+//Jarvis, A., H.I. Reuter, A. Nelson, E. Guevara. 2008. Hole-filled SRTM for the globe Version 4, available from the CGIAR-CSI SRTM 90m Database: http://srtm.csi.cgiar.org.
+var dem = ee.Image('USGS/SRTMGL1_003').clip(aoi_sh); 
+
+// calculate slope based on the DEM
+var terrain = ee.Algorithms.Terrain(dem); // calculates the slope in degrees (0 - 90)
+var slope = terrain.select('slope');
+
+
+////////////////////////////////////////////
+// PART 4: create the Landsat 8 mosaic   //
+//////////////////////////////////////////
+// Developed by Erik Lindquist (Erik.Lindquist@fao.org)
+
+// Function to correct for the latitudinal component of sun-sensor-target geometry per pixel
+// From the webpage landsat.usgs.gov/Landsat8_Using_Product.php
+// Function also produces a ‘weight’ band that allows the construction of a single, best-pixel mosaic.  
+// The ‘weight’ is a function of day of year, pixel temperature and wetness.  
+// Best-pixel mosaics can be tuned using the day of year to produce the best possible composite, closest to the desired time of year.
+
+// Create a range of date to filter imagery to use 
+// Landsat 8 was launched 11 Feb 2013
+// Change the years between 2013-now for yearly mosaics (but take into account that Sentinel-data is from 2015-2016)
+var t1start = '2013-01-01'; 
+var t1end = '2015-12-31';
+
+// paths/rows for Landsat scences
+var minpath = 164;
+var maxpath = 173;
+var minrow = 60;
+var maxrow = 69;
+
+
+// Which days of the year to use? season 1 = beginning of the year, rain season
+var julianDayStart_seas1 = 0;
+var julianDayEnd_seas1 = 200;
+
+// Which days of the year to use? season 2 = end of the year, dry season
+var julianDayStart_seas2 = 200;
+var julianDayEnd_seas2 = 305;
+
+// Target day for each mosaic; least cloudy / with most vegetation during the time period
+var targetday1 = 180; // season 1
+var targetday2 = 260; // season 2
+
+// Which cloud cover is accepted? 90 will look at any imagery up to 90% cloud cover
+// A higher threshold will include more imagery
+var cloudcovthres = 80;
+
+// ADD QUALITY BAND FOR LANDSAT8 to remove clouds
+// function starts here
+
+var addqa = function(image) {
+
+// Establish the thermal band for warmest pixel
+var temp = image.select('B10').focal_min();
+
+// Extract the cloud cover from Landsat metadata and use it as an inverse weight
+// e.g. to favor all pixels from an acquisition with low cloud cover
+// theoretically to help keep the resulting mosaic radiometrically uniform
+var cweight = image.metadata('CLOUD_COVER').subtract(100).multiply(-1);
+
+// Set a target date (DOY) for analysis
+var targday = ee.Number(targetday);
+// print(targetday);
+
+// Correct TOA reflectance for sun angle per pixel
+// Following the equations from http://www.itacanet.org/the-sun-as-a-source-of-energy/part-3-calculating-solar-angles/
+// and http://landsat.usgs.gov/Landsat8_Using_Product.php
+
+var timestamp = ee.Number(image.get('system:time_start'));
+var day = ee.Number(ee.Date(timestamp).getRelative('day', 'year'));
+var time = ee.Number(ee.Date(timestamp).get('minute'));
+
+// Use the specified target day also as a weight factor
+// theoretically to, again, help control the mosaic creation at the end
+// where images closer to the target date are favored
+
+var daydif = targday.subtract(day).abs();
+var daydif2 = ee.Number(365).subtract(daydif);
+
+// Back to correcting for sun angle...
+// Setup degrees to radians conversion
+
+var pi = ee.Number(3.14159265359);
+var pipi = pi.multiply(2);
+var deg2rad = pi.divide(180);
+
+// Calc precise day of year
+var part2 = day
+  .add(284)
+  .divide(36.25);
+
+// Calc declination angle
+var part22 = pipi
+  .multiply(part2);
+var part222 = part22.sin();
+
+var dec_angle = deg2rad
+  .multiply(23.45)
+  .multiply(part222);
+  
+//Hour angle
+//var local_time = 
+var hour_angle = deg2rad
+  .multiply(-22.5);
+
+//Per-pixel latitude and longitude
+//var latlon = ee.Image.pixelLonLat();
+var lat = ee.Image.pixelLonLat().select('latitude')
+  .multiply(deg2rad);
+
+
+//Solar elevation angle
+var cosh = hour_angle.cos();
+
+var cosd = dec_angle.cos();
+
+var coslat = lat.cos();
+
+var sind = dec_angle.sin();
+
+var sinlat = lat.sin();
+
+var solar_elev1 = coslat
+  .multiply(cosd)
+  .multiply(cosh);
+
+var solar_elev2 = sinlat
+  .multiply(sind);
+  
+var solar_elev = solar_elev1
+  .add(solar_elev2);
+  
+var toa_cor2 = solar_elev.sin();
+
+// correct the TOA for each band
+var adj3 = image.select('B3').float().divide(toa_cor2);
+var adj4 = image.select('B4').float().divide(toa_cor2);
+var adj5 = image.select('B5').float().divide(toa_cor2);
+var adj6 = image.select('B6').float().divide(toa_cor2);
+var adj7 = image.select('B7').float().divide(toa_cor2);
+
+// Multiply the corrected TOA by 10000
+var adj3_1 = adj3.multiply(10000);
+var adj4_1 = adj4.multiply(10000);
+var adj5_1 = adj5.multiply(10000);
+var adj6_1 = adj6.multiply(10000);
+var adj7_1 = adj7.multiply(10000);
+
+// add NDVI in the weight
+var ndvi = (image.select('B5').subtract(image.select('B4'))).divide(image.select('B5').add(image.select('B4')));
+var weight = ndvi.multiply(temp);
+var cweight2 = weight.multiply(daydif2).multiply(cweight);
+
+var output = image.addBands(adj3_1).addBands(adj4_1).addBands(adj5_1).addBands(adj6_1).addBands(adj7_1).addBands(temp).addBands(weight).addBands(cweight2);
+
+return output;
+};
+
+// Filter to include images for area of interest
+
+var PathFilter = ee.Filter.and(ee.Filter.gt('WRS_PATH', minpath),ee.Filter.lt('WRS_PATH', maxpath));
+var RowFilter = ee.Filter.and(ee.Filter.gt('WRS_ROW', minrow),ee.Filter.lt('WRS_ROW', maxrow));
+
+// Combine the filters for the differents seasons / all year
+var LocFilter = ee.Filter.and(PathFilter,RowFilter); 
+var DateFilter = ee.Filter.date(new Date(t1start), new Date(t1end));
+var DateLocFilter = ee.Filter.and(LocFilter,DateFilter);
+var DoyFilter_seas1 = ee.Filter.calendarRange(julianDayStart_seas1, julianDayEnd_seas1);
+var DoyFilter_seas2 = ee.Filter.calendarRange(julianDayStart_seas2, julianDayEnd_seas2);
+
+var cloudCoverFilter = ee.Filter.lt('CLOUD_COVER', cloudcovthres);
+var DateLocDoyFilter_seas1 = ee.Filter.and(DateLocFilter,DoyFilter_seas1,cloudCoverFilter);
+var DateLocDoyFilter_seas2 = ee.Filter.and(DateLocFilter,DoyFilter_seas2,cloudCoverFilter);
+
+// Define the input data set; in this case LANDSAT 8 and use filters
+var input_seas1 = ee.ImageCollection('LC8_L1T_TOA').filter(DateLocDoyFilter_seas1);
+var input_seas2 = ee.ImageCollection('LC8_L1T_TOA').filter(DateLocDoyFilter_seas2);
+
+// Map the ADD QUALITY BAND function 'addqa' across all images in the collection
+
+var targetday = targetday1; 
+var mosaic1_seas1 = input_seas1.map(addqa);
+var targetday = targetday2; 
+var mosaic1_seas2 = input_seas2.map(addqa);
+
+// USE THE QUALITY BAND TO create a 'best pixel' composite using the warmest, wettest pixel closest to
+// specified target date
+
+// var mosaic2_allyear = mosaic1_allyear.qualityMosaic('B5_3').int16();
+var mosaic2_seas1 = mosaic1_seas1.qualityMosaic('B5_3').int16();
+var mosaic2_seas2 = mosaic1_seas2.qualityMosaic('B5_3').int16();
+
+// Select the bands to use: 3 (green), 4 (red), 5 (NIR), 6 (SWIR1), 7 (SWIR2)  
+// these bands are relevant for vegetation
+// also, clip to area of interest extent 
+var input_bands_seas1 = mosaic2_seas1.clip(aoi_sh).select("B3_1","B4_1","B5_1","B6_1","B7_1");
+var input_bands_seas2 = mosaic2_seas2.clip(aoi_sh).select("B3_1","B4_1","B5_1","B6_1","B7_1");
+
+// Add NDVI for each season
+
+var red1 = mosaic2_seas1.select('B4_1');
+var nir1 = mosaic2_seas1.select('B5_1');
+var ndvi_seas1 = nir1.subtract(red1).divide(nir1.add(red1));
+var ndvi_seas1 = ndvi_seas1.multiply(10000);
+
+var red2 = mosaic2_seas2.select('B4_1');
+var nir2 = mosaic2_seas2.select('B5_1');
+var ndvi_seas2 = nir2.subtract(red2).divide(nir2.add(red2));
+var ndvi_seas2 = ndvi_seas2.multiply(10000);
+
+// calculate the NDVI difference of the two seasons
+var ndvi_seas_difference = ndvi_seas2.subtract(ndvi_seas1);
+
+// Add a function to create Landsat 8 bands ratios 
+
+var ratbands = function(mosaic) {
+  var rat45 = mosaic.select("B4_1").divide(mosaic.select("B5_1"));
+  var rat46 = mosaic.select("B4_1").divide(mosaic.select("B6_1"));
+  var rat47 = mosaic.select("B4_1").divide(mosaic.select("B7_1"));
+  var rat56 = mosaic.select("B5_1").divide(mosaic.select("B6_1"));
+  var rat57 = mosaic.select("B5_1").divide(mosaic.select("B7_1"));
+  var rat67 = mosaic.select("B6_1").divide(mosaic.select("B7_1"));
+  var ratstack = rat45.addBands(rat46).addBands(rat47).addBands(rat56).addBands(rat57).addBands(rat67);
+  return(ratstack);
+};
+  
+//Create the ratio band stacks for both seasons            
+var ratio_bands_seas1 = ratbands(input_bands_seas1);
+var ratio_bands_seas2 = ratbands(input_bands_seas2);
+
+
+//////////////////////////////////////////////
+// PART 5: Add Sentinel-2 mosaic         ////
+////////////////////////////////////////////
+//this part of the script by Remi D'Annunzio (remi.dannunzio@fao.org)
+
+// cloudMask for Sentinel-2
+function cloudMask_jrc(im) {
+  // Opaque and cirrus cloud masks cause bits 10 and 11 in QA60 to be set,
+  // so values less than 1024 are cloud-free
+  var cloud1 = ee.Image(0).where(im.select('QA60').gte(1024), 1);//.not();
+  var cloud2 = ee.Image(0).where(im.select('B2').gte(1200), 1);//.not();
+  var cloud2b = cloud2.focal_min(200,'circle','meters');
+  var clouds=((cloud1.eq(1)).or(cloud2b.eq(1))); // compute the n of cloudfree observations
+
+   //im = im.updateMask(maskblue2);
+   im = im.addBands(clouds.eq(0).select([0],["cloudfree"])); // and add a band with this information
+   return im.updateMask(clouds.eq(0));
+  }
+
+// Create a location filter
+var LocFilter = ee.Filter.bounds(aoi_sh);
+
+// Create a range of date to filter imagery to use (Sentinel-2 was launched June 2015)
+var DateFilter = ee.Filter.date('2015-06-01', '2016-12-31');
+
+// Combine date and localisation Filters into single filters
+var DateLocFilter = ee.Filter.and(LocFilter,DateFilter);
+
+// Call the sentinel 2 collection
+var inputs2 = ee.ImageCollection('COPERNICUS/S2').filter(DateLocFilter);
+
+// Mask out the clouds
+var s2clouds=inputs2.map(cloudMask_jrc);
+
+ // Take only the median observations and select 10m bands
+var median_sentinel2 = s2clouds.select(['B2','B3','B4','B8','B11']).reduce(ee.Reducer.intervalMean(25,75)).clip(aoi_sh);
+
+// Un-comment to see the Landsat-8 and Sentinel-2 properties in Console
+//print(input_seas1, 'Season1_LS');
+//print(input_seas2, 'Season2_LS');
+//print(inputs2, 'Sentinel2');
+
+///////////////////////////////////////
+/////// PART 6: Stack the layers /////
+/////////////////////////////////////
+
+// The final input data set stack with Landsat-8, ratio bands and ndvi for both seasons, dem, slope and Sentinel-2
+ var rgb_final_doubleseas = input_bands_seas1
+                          .addBands(ratio_bands_seas1)
+                          .addBands(ndvi_seas1)
+                          .addBands(input_bands_seas2)
+                          .addBands(ratio_bands_seas2)
+                          .addBands(ndvi_seas2)
+                          .addBands(ndvi_seas_difference)
+                          .addBands(dem).addBands(slope)
+                          .addBands(sentinel_VH).addBands(sentinel_VV)
+                          .addBands(median_sentinel2);  
+                           
+////////////////////////////////////////////////////////////
+//  PART 7: Load training data for planted area mapping ///
+///////////////////////////////////////////////////////////
+
+// all the data collected at mapathon, cleaned (removed unsure observations), use plantation_non_plantation column
+// var tra_data = ee.FeatureCollection("ft:1w-pbgRr9_dz13yLEpgJpGyyQgeF-ji-4D8Eq7EkG").filterBounds(aoi_sh); 
+
+// the same data but with extra observations from plantations
+ var tra_data = ee.FeatureCollection("ft:14XyJICHBxSZ6zidKNRGscfkWgw3dpmzekan6MPWv").filterBounds(aoi_sh); 
+
+
+////////////////////////////////////////////////////
+//// PART 8: Plantation area  classification   ////
+//////////////////////////////////////////////////
+
+// Define which training data, column and classifier to use
+var trainingdata = tra_data ;                                 
+var samplecolumns = ['id', 'location_x', 'location_y','land_use', 'land_use_type','type_specification','canopy_cover', 'imagery_date_year', 'land_use_code', 'plantation_non_plantation', 'species_code', 'age_code', 'density_code', 'tree_code', 'pla_fo_other'];
+var image_stack = rgb_final_doubleseas;
+var trainingcolumn = 'plantation_non_plantation';
+
+// Train the classifier with specified inputs.
+var training = image_stack.sampleRegions(trainingdata, samplecolumns, 30);
+
+// Un-comment next line to export the training result
+Export.table.toDrive(training, 'trained_data_plantation_area', 'trained_data_plantation_area' , "CSV");
+
+// Option 1: Train and classify the image input stack using Random Forest
+var rf_classifier = ee.Classifier.randomForest(150).train(training, trainingcolumn);
+var classimg_all = image_stack.classify(rf_classifier);
+
+// Option 2: Train and classify with SVM classifier 
+//var svm_classifier = ee.Classifier.svm();
+// Train the classifier.
+//var trained = svm_classifier.train(training, trainingcolumn);
+// Classify the image.
+//var classimg_all = image_stack.classify(trained);
+
+// mask with water and large wetlands to avoid errors there
+// again, this is an asset in GEE, request for access to it or create our own mask.
+var water_wetlandmask = image3.select('b1');
+var classimg_all = classimg_all.mask(water_wetlandmask);
+
+
+//////////////////////////////////
+// PART 9: Accuracy assessment // 
+////////////////////////////////
+
+// Accuracy assessment can't currently be done on the fly, but the created map can be sampled and the csv exported for AA in some other software.
+
+// Define the validation data set
+var validation = ee.FeatureCollection("ft:1rSHVyD5G2spVXCIa7ABqV6gk_iyTVAvHcD371TW8");
+// Sample the created map with the validation data
+var validated = classimg_all.sampleRegions(validation, ['plantation_non_plantation'], 30);
+
+// Un-comment next line to export the validation result
+//Export.table.toDrive(validated, 'validation_data', 'validation_data' , "CSV");
+
+
+////////////////////////////////////////////////////////////////
+//     SECOND STAGE OF THE MAPPING:                          //
+//  Use the created mask to classify plantation attributes. //
+/////////////////////////////////////////////////////////////
+
+
+/////////////////////////////////////////////////////////////////////
+//  PART 10: Load training data  for plantation attribute mapping //
+///////////////////////////////////////////////////////////////////
+
+// data for classifying the plantation species, with some extra points collected after mapathon, you need to classify only the plantation mask area from previous step for this to work.
+// use species_code (1=pine, 2=eucalyptus, 3= wattle, 4= euca or wattle, 5= other or unknown)
+// OR species_group_code column (1=pine, 2= eucalyptus or wattle, 3= other or unknown)
+var plantation_species = ee.FeatureCollection("ft:1iclmthqrXqiLYmDTLiLH0_eLtft2aLHKpeQH_uqd").filterBounds(aoi_sh); 
+
+//plantationdata, all mapathon observations with age, age_code column
+var plantation_age = ee.FeatureCollection("ft:1BTVWKYXd9YONAYwJNoJSFjhNYd9wUoNJaEDprRWz").filterBounds(aoi_sh); 
+
+//plantationdata, all mapathon observations with density, density_code column
+var plantation_density = ee.FeatureCollection("ft:1qKLxN-u7OiuDGVubuMIIOj0d_KXyDlT4j-uVhLK5").filterBounds(aoi_sh); 
+
+/////////////////////////////////////////////////////////
+//// PART 11: Plantation attribute classification   ////
+///////////////////////////////////////////////////////
+
+/////////            SPECIES          \\\\\\\\\\\
+// Define which training data, column and classifier to use
+var att_trainingdata = plantation_species;   
+var samplecolumns = ['id', 'location_x', 'location_y','land_use', 'land_use_type','type_specification','canopy_cover', 'imagery_date_year', 'land_use_code', 'plantation_non_plantation', 'species_code', 'age_code', 'density_code', 'tree_code', 'pla_fo_other'];
+var att_trainingcolumn = 'species_code';
+// The image stack is the same as in stage 1 but masked with the plantation area
+var att_image_stack = image_stack.mask(classimg_all);
+
+// Train the classifier with specified inputs.
+var att_training = att_image_stack.sampleRegions(att_trainingdata, samplecolumns, 30);
+
+// Define the name for the training result file to export
+var att_filename = 'trained_data_species';
+// Un-comment next line to export the training result
+Export.table.toDrive(att_training, att_filename, att_filename , "CSV");
+
+// Classify with Random Forest
+var att_rf_classifier = ee.Classifier.randomForest(150).train(att_training, att_trainingcolumn);
+var species_classimg_all = att_image_stack.classify(att_rf_classifier);
+
+// Mask the classified plantation attribute image with itself
+var species_classimg_all = species_classimg_all.mask(species_classimg_all);
+
+
+///////////       AGE CLASS            \\\\\\\\\\\\
+// Define which training data, column and classifier to use
+var att_trainingdata = plantation_age;   
+var samplecolumns = ['id', 'location_x', 'location_y','land_use', 'land_use_type','type_specification','canopy_cover', 'imagery_date_year', 'land_use_code', 'plantation_non_plantation', 'species_code', 'age_code', 'density_code', 'tree_code', 'pla_fo_other'];
+var att_trainingcolumn = 'age_code';
+// The image stack is the same as in stage 1 but masked with the plantation area
+var att_image_stack = image_stack.mask(classimg_all);
+
+// Train the classifier with specified inputs.
+var att_training = att_image_stack.sampleRegions(att_trainingdata, samplecolumns, 30);
+
+// Define the name for the training result file to export
+var att_filename = 'trained_data_age';
+// Un-comment next line to export the training result
+Export.table.toDrive(att_training, att_filename, att_filename , "CSV");
+
+// Classify with Random Forest
+var att_rf_classifier = ee.Classifier.randomForest(150).train(att_training, att_trainingcolumn);
+var age_classimg_all = att_image_stack.classify(att_rf_classifier);
+
+// Mask the classified plantation attribute image with itself
+var age_classimg_all = age_classimg_all.mask(age_classimg_all);
+
+
+//////////      DENSITY CLASS     \\\\\\\\\\\\
+
+// Define which training data, column and classifier to use
+var att_trainingdata = plantation_density;   
+var samplecolumns = ['id', 'location_x', 'location_y','land_use', 'land_use_type','type_specification','canopy_cover', 'imagery_date_year', 'land_use_code', 'plantation_non_plantation', 'species_code', 'age_code', 'density_code', 'tree_code', 'pla_fo_other'];
+var att_trainingcolumn = 'density_code';
+// The image stack is the same as in stage 1 but masked with the plantation area
+var att_image_stack = image_stack.mask(classimg_all);
+
+// Train the classifier with specified inputs.
+var att_training = att_image_stack.sampleRegions(att_trainingdata, samplecolumns, 30);
+
+// Define the name for the training result file to export
+var att_filename = 'trained_data_density';
+// Un-comment next line to export the training result
+Export.table.toDrive(att_training, att_filename, att_filename , "CSV");
+
+// Classify with Random Forest
+var att_rf_classifier = ee.Classifier.randomForest(150).train(att_training, att_trainingcolumn);
+var density_classimg_all = att_image_stack.classify(att_rf_classifier);
+
+// Mask the classified plantation attribute image with itself
+var density_classimg_all = density_classimg_all.mask(density_classimg_all);
+
+
+/////////////////////////////////////////////////////////
+//// PART 12: Plantation attribute accuracy         ////
+///////////////////////////////////////////////////////
+// Can be done if there is field data about the attributes
+
+// Sample the classified image with a validation data set
+//var validation = ee.FeatureCollection("ft:1KBtVTCN2pWsEUqPtYag2MUWA1xOF3vr_yCDN9wwW");
+// Classify the validation data.
+//var validated = att_classimg_all.sampleRegions(validation,  ['plantation'], 30);
+// Export.table.toDrive(validated, 'validation_species', 'validation_species' , "CSV");
+
+/////////////////////////////////////////////////
+//   PART 13: Add layers in Map view          //
+///////////////////////////////////////////////
+// See 'Layers' in  the top right corner of the Map view
+
+// choose Landsat bands for visualisation 
+var vis_bands_seas1 = mosaic2_seas1.clip(aoi_sh).select("B5_1","B6_1","B4_1");
+var vis_bands_seas2 = mosaic2_seas2.clip(aoi_sh).select("B5_1","B6_1","B4_1"); 
+// Define Landsat visual parameters
+var vis = {min:100, max:5000, gamma:1.2};
+
+// Add Landsat mosaics in map view
+Map.addLayer(vis_bands_seas2, vis, 'Landsat end of year', false);
+Map.addLayer(vis_bands_seas1, vis, 'Landsat beginning of year', false);
+
+// Add seasonal NDVIs in map view (values have been multiplied by 10000)
+Map.addLayer(ndvi_seas2,  {min:1000, max: 7000, palette: ['4dff4d', '000000']}, 'NDVI end of year', false);
+Map.addLayer(ndvi_seas1,  {min:1000, max: 7000, palette: ['4dff4d', '000000']}, 'NDVI beginning of year', false);
+
+// Add NDVI difference in map view: yellow = seasonal difference, blue = no difference or positive difference (wetlands, evergeen forests)
+Map.addLayer(ndvi_seas_difference,  {min:-5000, max: 0, palette: ['ffff00', '000099']}, 'NDVI seasonal difference', false);
+
+// Add Sentinel-2 in map view
+Map.addLayer(median_sentinel2.clip(aoi_sh),{bands:['B4_mean','B3_mean','B2_mean'], min:500, max:2000},'median_sentinel', false);
+// Add Sentinel 2 in NIR-SWIR-R in map view 
+Map.addLayer(median_sentinel2.clip(aoi_sh),{bands:['B8_mean','B11_mean','B4_mean'], min:500, max:3000,'gamma': 1.2},'median_sentinel_NIR-SWIR-R', false);
+      
+// Add Plantation-non-plantation map in map view
+// Map.addLayer(classimg_all.mask(classimg_all).clip(aoi_sh), {min:0, max: 1, palette: ['0000ff', 'ff0000'']},'Plantations', false);
+
+// Add Plantations by species in map view: blue = pine, red = eucalyptus, yellow = wattle, orange = euca or wattle, purple = mixed or unknown
+// Map.addLayer(species_classimg_all, {min:1, max: 5, palette: ['0000ff', 'ff0000', 'ffff1a', 'ff6600', 'cc0099']},'Plantations');
+
+// Add Plantations by species group in map view: blue = pine, red = eucalyptus, wattle, euca or wattle, yellow = mixed or unknown
+// Map.addLayer(species_classimg_all, {min:1, max: 3, palette: ['0000ff', 'ff0000', 'ffff1a']},'Plantations');
+
+// Add Plantations by age classes in map view: blue = recently planted, red = growing, yellow = mature ['0000ff', 'ff0000', 'ffff1a'] 
+// Map.addLayer(age_classimg_all, {min:1, max: 5, palette: ['0000ff', 'ff0000', 'ffff1a']},'Plantations');
+
+// Add Plantations by density classes in map view: blue = sparse, red = intyermediate, yellow = dense ['0000ff', 'ff0000', 'ffff1a'] 
+// Map.addLayer(density_classimg_all, {min:1, max: 5, palette: ['0000ff', 'ff0000', 'ffff1a']},'Plantations');
+
+
+/////////////////////////////////////////////////////////////////
+// PART 14:  Export the mapping result to your Google Drive ////
+///////////////////////////////////////////////////////////////
+// Exporting is done in 30 tiles because as one image this big area will fail
+
+// Selecting the image to export; uncomment the line you want to use
+// Plantation area
+var export_image = classimg_all;
+// Species
+// var export_image = species_classimg_all;
+// Age class
+// var export_image = age_classimg_all;
+// Density
+// var export_image = density_classimg_all;
+
+// The beginning of the name to give the tiles to export (will have the tile number added)
+var image_name = 'plantations_RF150_36S_';
+// The CRS to use (EPSG code)
+var crs = 'EPSG:32736';
+// resolution to export in meters
+var scale = 30;
+
+// Bounding coordinates for the tiles:
+var lon_start = 31.9;
+var lon_end = 37;
+var lat_start = -10.9;
+var lat_end = -6.7;
+
+// Tile size (edge of a square) in degrees
+var edge = 1;
+
+var polys = [];
+for (var lon = lon_start; lon < lon_end; lon += edge) {
+  var x1 = lon - edge/2;
+  var x2 = lon + edge/2;
+  for (var lat = lat_start; lat < lat_end; lat += edge) {
+    var y1 = lat - edge/2;
+    var y2 = lat + edge/2;
+    polys.push(ee.Geometry.Rectangle(x1, y1, x2, y2));
+  }
+}
+var grid = ee.FeatureCollection(polys);
+
+//  Un-comment the next line to see what the tile grid is like
+// Map.addLayer(grid, {palette: '000000'}, "Grid");
+
+// Create a geometry representing an export region.
+var features = grid.getInfo().features;
+
+// for loop calling the features and downloading them
+for (var i = 0; i < features.length; ++i) {
+//var i = 17;
+var thisFeature = features[i].geometry.coordinates[0];
+
+
+// Un-comment next line when you want to export. Start the export from TASKS panel on the right
+Export.image(export_image, image_name + [i], {'crs': crs, 'region': thisFeature, 'scale': scale});
+ }
+
+// Once downloaded, clip to extent you want to use e.g. with gdalwarp
+// gdalwarp -cutline cutting_shapefile.shp -ot Byte -co "COMPRESS=LZW" input.tif output.tif
+// Don't use crop_to_cutline option
+// This way you don't accidentally resample the raster
